@@ -1,393 +1,406 @@
-const $ = (id) => document.getElementById(id);
-let me = null;
-let chain = null;
-let world = null;
-let active = null;
-let roomSlug = "";
-let tick = null;
+import { ChainReader, activity, worldFromCore, API } from './chain.js';
+import { DeviceStore } from './device.js';
+
+/** @returns {any} */
+const $ = id => document.getElementById(id);
+let me = null, active = null, world = null;
+let roomSlug = '', currentView = 'home', mode = 'loading', serverOffset = 0;
+let refreshing = null, starting = false, roomBusy = false, authReturn = null;
+const chainReader = new ChainReader();
+let device;
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
-    method: options.method || "GET",
-    headers: options.body ? { "Content-Type": "application/json" } : undefined,
-    body: options.body ? JSON.stringify(options.body) : undefined,
-  });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.error || "Request failed");
-  return payload;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+  try {
+    const response = await fetch(new URL(path.replace(/^\//, ''), document.baseURI), {
+      method: options.method || 'GET', credentials: 'same-origin', cache: 'no-store', signal: controller.signal,
+      headers: options.body ? { 'Content-Type': 'application/json' } : { Accept: 'application/json' },
+      body: options.body ? JSON.stringify(options.body) : undefined,
+    });
+    if (!response.headers.get('Content-Type')?.includes('application/json')) throw new Error('The shared service did not return JSON. Check that the Squeek Hours server is running.');
+    const payload = await response.json();
+    if (!response.ok) {
+      if (response.status === 401 && me) { me = null; active = null; roomSlug = ''; clearPrivateViews(); }
+      throw new Error(payload.error || `Request failed (HTTP ${response.status}). Try again.`);
+    }
+    return payload;
+  } catch (error) {
+    if (error.name === 'AbortError') throw new Error('The shared service timed out. Check your connection and try again.');
+    if (error instanceof TypeError) throw new Error('The shared service is unreachable. Check your connection and try again.');
+    throw error;
+  } finally { clearTimeout(timeout); }
+}
+
+async function handle(target, action, control = null) {
+  $(target).textContent = '';
+  if (control) control.disabled = true;
+  try { await action(); }
+  catch (error) { $(target).textContent = error.message || 'Unable to complete this action. Try again.'; }
+  finally { if (control) control.disabled = false; }
 }
 
 function clockText(seconds) {
-  const safe = Math.max(0, seconds | 0);
-  return `${String(Math.floor(safe / 60)).padStart(2, "0")}:${String(safe % 60).padStart(2, "0")}`;
+  const safe = Math.max(0, Math.ceil(seconds));
+  return `${String(Math.floor(safe / 60)).padStart(2, '0')}:${String(safe % 60).padStart(2, '0')}`;
 }
 
-function show(name) {
-  document.querySelectorAll(".view").forEach((view) => view.classList.toggle("hidden", view.id !== `view-${name}`));
-  document.querySelectorAll("nav button").forEach((button) => button.classList.toggle("on", button.dataset.view === name));
-  if (name === "rooms") loadRooms();
-  if (name === "world") paintWorld();
-  if (name === "expeditions") loadExpedition();
-  if (name === "board") loadBoard();
-  if (name === "profile") paintProfile();
-}
-
-function paintChain() {
-  const visual = chain?.visual || "UNAVAILABLE";
-  const clock = $("clock");
-  clock.classList.toggle("rest", visual === "RESTING");
-  clock.classList.toggle("down", visual === "UNAVAILABLE");
-  const settlement = chain?.settlement === "SETTLING" ? " · settling" : "";
-  $("chain-state").textContent = visual + settlement;
-  if (!active && $("timer").textContent === "Reading the chain…") $("timer").textContent = "25:00";
-  const round = chain?.round ? `Settled round ${chain.round}` : "No confirmed round";
-  const work = chain?.work ? ` · ${chain.work} work` : "";
-  const pending = chain?.pendingRound ? ` · round ${chain.pendingRound} not certified` : "";
-  $("chain-line").textContent = chain?.reason || `${round}${work}${pending}`;
-}
-
-function paintSession() {
-  $("cancel").classList.toggle("hidden", !active);
-  $("start-25").disabled = Boolean(active);
-  $("start-50").disabled = Boolean(active);
-  if (!active) {
-    $("timer").textContent = "25:00";
-    return;
-  }
-  $("timer").textContent = clockText(active.remaining);
-  $("session-note").textContent = `${active.kind === "custom" ? "Custom" : active.kind + " minute"} session · ${clockText(active.remaining)} left`;
-}
-
-async function refreshMe() {
-  const payload = await api("/api/me");
-  me = payload.user ? payload : null;
-  const next = payload.active || null;
-  const justFinished = active && !next;
-  active = next;
-  $("who").textContent = payload.user ? payload.user.username : "Guest";
-  $("auth-open").textContent = payload.user ? "Sign out" : "Sign in";
-  paintSession();
-  if (justFinished) {
-    $("session-note").textContent = "Session saved.";
-    paintProfile();
-  }
-}
-
-function interpretStatus(payload) {
-  if (!payload || payload.schemaVersion !== 1 || !payload.builder?.anchor?.settledThroughRound) {
-    return { visual: "UNAVAILABLE", settlement: "UNAVAILABLE", round: null, work: null, reason: "Squeekchain status is unread. Missing data is not zero activity." };
-  }
-  const measurement = payload.measurement || {};
-  const anchor = payload.builder.anchor;
-  const observed = Date.parse(measurement.observedAt || "");
-  const limit = (Number(measurement.staleAfterSeconds) || 120) * 1000;
-  const fresh = measurement.freshness === "online" && Number.isFinite(observed) && Date.now() - observed < limit;
-  const status = measurement.coreStatus;
-  const visual = !fresh || !status ? "UNAVAILABLE" : status === "ACTIVE" ? "LIVE" : status === "IDLE" ? "RESTING" : "UNAVAILABLE";
-  const submission = payload.settlementQueue?.latestSubmission || {};
-  const confirmed = submission.lifecycle === "confirmed" && String(submission.settledThroughRound) === String(anchor.settledThroughRound);
-  const pending = submission.settledThroughRound && !confirmed ? String(submission.settledThroughRound) : null;
-  const round = Number(anchor.settledThroughRound);
-  const stages = [[0, "The First Burrow"], [800, "The Growing Village"], [2000, "The Hamster City"], [5000, "The Crystal Kingdom"], [10000, "The Infinite World"]];
-  let name = stages[0][1];
-  let index = 1;
-  let nextRound = stages[1][0];
-  stages.forEach(([floor, label], number) => {
-    if (round >= floor) {
-      name = label;
-      index = number + 1;
-      nextRound = stages[number + 1] ? stages[number + 1][0] : null;
-    }
+function show(name, focus = false) {
+  if (!['home', 'rooms', 'world', 'expeditions', 'board', 'profile'].includes(name)) name = 'home';
+  currentView = name;
+  document.querySelectorAll('.view').forEach(view => view.classList.toggle('hidden', view.id !== `view-${name}`));
+  document.querySelectorAll('nav button').forEach(button => {
+    const on = /** @type {HTMLElement} */ (button).dataset.view === name;
+    button.classList.toggle('on', on);
+    if (on) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current');
   });
-  return {
-    chain: {
-      visual,
-      settlement: pending ? "SETTLING" : "CONFIRMED",
-      round: String(anchor.settledThroughRound),
-      work: String(anchor.cumulativeWork),
-      pendingRound: pending,
-      reason: visual === "UNAVAILABLE" ? "Fresh activity is not available. The hamster is not shown as resting." : null
-    },
-    world: { stage: index, name, settledRounds: round, nextRound }
-  };
+  if (focus) {
+    const heading = $(`view-${name}`).querySelector('h1,h2');
+    heading.setAttribute('tabindex', '-1'); heading.focus();
+  }
+  if (name === 'rooms') handle('room-error', loadRooms);
+  if (name === 'world') paintWorld();
+  if (name === 'expeditions') handle('page-error', loadExpedition);
+  if (name === 'board') handle('board-note', loadBoard);
+  if (name === 'profile') paintProfile();
+}
+
+const formatted = value => BigInt(value).toLocaleString('en-US');
+function paintChain() {
+  const core = chainReader.slots.core, status = chainReader.slots.status;
+  const stale = chainReader.isStale('core');
+  const wheel = activity(status.data, Date.now(), chainReader.isStale('status'));
+  $('clock').classList.toggle('rest', wheel.state === 'resting');
+  $('clock').classList.toggle('down', wheel.state === 'unavailable');
+  $('chain-state').textContent = wheel.state === 'resting' ? `Wheel resting · ${wheel.rpm} rpm` : wheel.state === 'active' ? `Wheel active · ${wheel.rpm} rpm` : 'Wheel activity unavailable';
+  $('chain-state').classList.toggle('muted', wheel.state === 'unavailable');
+  if (core.data) {
+    const c = core.data.core;
+    $('chain-line').textContent = `${stale ? 'Last confirmed snapshot' : 'Confirmed'} · round ${formatted(c.settledThroughRound)} · ${formatted(c.cumulativeWork)} work · block ${formatted(c.blockHeight)}`;
+    $('chain-freshness').textContent = `${stale ? 'Stale · ' : ''}Checked ${new Date(core.checkedAt).toLocaleTimeString()}${core.error ? ` · ${core.error}` : stale ? ' · The confirmed read has not advanced recently.' : ' · Sepolia, 12 confirmations.'}`;
+    $('chain-proof').textContent = `Confirmed source: ${API}/v1/core. Safe Ethereum block ${core.data.chain.safeThroughBlock}. Settlement transaction recorded ${new Date(Number(core.data.source.blockTimestamp) * 1000).toLocaleString()}.`;
+    $('chain-tx').href = `https://sepolia.etherscan.io/tx/${core.data.source.transactionHash}`;
+    $('chain-tx').classList.remove('hidden');
+    world = worldFromCore(core.data);
+  } else {
+    $('chain-line').textContent = 'Confirmed settlement unavailable';
+    $('chain-freshness').textContent = core.error || 'Waiting for the official API.';
+    $('chain-proof').textContent = `Confirmed source: ${API}/v1/core. Missing data is unknown, never zero.`;
+    $('chain-tx').classList.add('hidden');
+  }
+  const submission = status.data?.settlementQueue?.latestSubmission;
+  const pending = !chainReader.isStale('status') && ['preparing', 'submitted', 'retrying'].includes(submission?.lifecycle)
+    && typeof submission?.settledThroughRound === 'string' && /^\d+$/.test(submission.settledThroughRound)
+    && (!core.data || BigInt(submission.settledThroughRound) > BigInt(core.data.core.settledThroughRound));
+  $('chain-pending').textContent = pending ? `Provisional · round ${submission.settledThroughRound} ${submission.lifecycle}; not confirmed.`
+    : status.error ? `Activity read failed · ${status.error}`
+    : wheel.state === 'unavailable' ? 'No fresh measurement. Missing activity is not a resting wheel.'
+    : `Provisional measurement · ${wheel.provenance || 'provenance unavailable'} · ${new Date(wheel.observedAt).toLocaleTimeString()}`;
 }
 
 async function refreshChain() {
-  try {
-    const payload = await api("/api/chain");
-    chain = payload.chain;
-    world = payload.world;
-  } catch {
-    const response = await fetch("https://api.squeekchain.com/v1/status", { cache: "no-store" });
-    if (!response.ok) throw new Error("Status unread");
-    const read = interpretStatus(await response.json());
-    chain = read.chain;
-    world = read.world;
-  }
-  paintChain();
-  paintWorld();
+  await Promise.all(['core', 'status'].map(async name => { await chainReader.read(name); paintChain(); paintWorld(); }));
+}
+
+function remaining() {
+  if (!active) return 0;
+  return Math.max(0, Math.ceil((Date.parse(active.startedAt) + active.plannedSeconds * 1000 - Date.now() - serverOffset) / 1000));
+}
+function paintSession() {
+  const busy = !!active || starting || mode === 'loading';
+  ['start-25', 'start-50', 'start-custom'].forEach(id => { $(id).disabled = busy; });
+  $('custom-minutes').disabled = busy;
+  $('cancel').classList.toggle('hidden', !active);
+  $('timer').textContent = active ? clockText(remaining()) : '25:00';
+  if (active) $('session-note').textContent = `${active.kind === 'custom' ? 'Custom' : active.kind + ' minute'} session · ${mode === 'device' ? 'saved on this device' : 'saved on the server'}`;
+}
+
+async function refreshMe() {
+  if (refreshing) return refreshing;
+  refreshing = (async () => {
+    const payload = mode === 'server' ? await api('/api/me') : await device.snapshot();
+    if (payload.serverNow) serverOffset = Date.parse(payload.serverNow) - Date.now();
+    else serverOffset = 0;
+    const was = active, previousSessions = me?.stats?.sessions || 0, previousUser = me?.user;
+    me = payload.user ? payload : null; active = payload.active || null;
+    if (mode === 'server' && previousUser && !me) { roomSlug = ''; clearPrivateViews(); }
+    $('who').textContent = mode === 'device' ? 'On this device' : payload.user?.username || 'Guest';
+    $('auth-open').textContent = mode === 'device' ? 'About accounts' : payload.user ? 'Sign out' : 'Sign in';
+    document.body.dataset.theme = payload.user?.theme || 'burrow';
+    paintSession();
+    if (was && !active) {
+      $('session-note').textContent = (me?.stats?.sessions || 0) > previousSessions
+        ? `Session saved · ${mode === 'device' ? 'device profile updated' : 'profile updated'}.`
+        : 'Session ended or was cancelled in another tab.';
+      refreshToday().catch(error => { $('page-error').textContent = error.message; });
+    }
+    if (currentView === 'profile') paintProfile();
+  })().finally(() => { refreshing = null; });
+  return refreshing;
 }
 
 async function refreshToday() {
-  let payload;
-  try {
-    payload = await api("/api/expedition");
-  } catch {
-    $("today").textContent = "—";
-    $("live-count").textContent = "Room counts need the Squeek Hours server.";
-    $("mission-name").textContent = "Mission 001 — Build the First City";
-    $("mission-bar").textContent = "Community totals are counted by the server, not by the chain.";
-    return;
+  if (mode === 'device') {
+    const snapshot = await device.snapshot();
+    const state = device.load(), today = new Date().toISOString().slice(0, 10);
+    $('today').textContent = String(state.sessions.filter(row => row.endedAt.startsWith(today)).reduce((sum, row) => sum + row.plannedSeconds / 60, 0));
+    $('today-label').textContent = 'focus minutes on this device today (UTC)';
+    $('live-count').textContent = 'Shared room counts need the Squeek Hours server.';
+    $('mission-bar').textContent = 'Shared expedition totals unavailable in device mode.';
+    return snapshot;
   }
-  $("today").textContent = String(payload.community.todayMinutes);
-  $("live-count").textContent = `${payload.community.activeUsers} people in rooms right now`;
-  const mission = payload.mission;
-  const done = Math.min(mission.sessions, payload.community.sessions);
-  $("mission-name").textContent = `Mission ${mission.id} — ${mission.name}`;
-  $("mission-bar").textContent = `${done} / ${mission.sessions} sessions · ${payload.community.minutes} / ${mission.minutes} minutes`;
+  try {
+    const payload = await api('/api/expedition');
+    $('today').textContent = String(payload.community.todayMinutes);
+    $('today-label').textContent = 'community focus minutes today (UTC)';
+    $('live-count').textContent = `${payload.community.activeUsers} people in rooms right now`;
+    const mission = payload.mission;
+    $('mission-name').textContent = `Mission ${mission.id} · ${mission.name}`;
+    $('mission-bar').textContent = `${payload.community.sessions} / ${mission.sessions} sessions · ${payload.community.minutes} / ${mission.minutes} minutes`;
+  } catch (error) {
+    $('today').textContent = 'Unavailable'; $('live-count').textContent = 'Shared participation could not be loaded.';
+    $('mission-bar').textContent = 'Community progress unavailable. Check the shared service.';
+    throw error;
+  }
 }
 
-async function start(kind) {
-  if (!me?.user) {
-    $("auth").showModal();
-    return;
-  }
-  const payload = await api("/api/sessions", { method: "POST", body: { kind, room: roomSlug || undefined } });
-  active = { id: payload.id, kind, remaining: payload.remaining };
-  paintSession();
+function openAuth() {
+  authReturn = document.activeElement;
+  $('auth-title').textContent = mode === 'device' ? 'Accounts need the shared service' : 'Sign in';
+  $('auth-help').textContent = mode === 'device' ? 'This static site keeps focus sessions in this browser. Accounts, shared rooms and the league work when this app runs with its Python server. Device sessions are not uploaded or added to shared rankings.' : 'Use your Squeek Hours account. This is separate from a Squeekchain Community account.';
+  $('auth-fields').classList.toggle('hidden', mode === 'device');
+  $('auth-error').textContent = '';
+  $('auth').showModal();
+}
+
+async function start(kind, minutes = undefined) {
+  if (mode === 'loading' || starting) return;
+  if (mode === 'server' && !me?.user) { openAuth(); return; }
+  starting = true; paintSession();
+  try {
+    if (mode === 'device') await device.start(kind, minutes);
+    else await api('/api/sessions', { method: 'POST', body: { kind, minutes, room: roomSlug || undefined } });
+    await refreshMe();
+  } finally { starting = false; paintSession(); }
 }
 
 async function loadRooms() {
-  const payload = await api("/api/rooms");
-  const list = $("room-list");
-  list.replaceChildren();
-  payload.rooms.forEach((room) => {
-    const card = document.createElement("article");
-    const title = document.createElement("h2");
-    title.textContent = room.name;
-    const meta = document.createElement("p");
-    meta.textContent = `${room.live} here now`;
-    const button = document.createElement("button");
-    button.type = "button";
-    button.textContent = "Join";
-    button.addEventListener("click", () => enter(room.slug));
-    card.append(title, meta, button);
-    list.appendChild(card);
+  if (mode !== 'server') {
+    $('rooms-status').textContent = 'Shared rooms need the Squeek Hours server. You can still focus and save a profile on this device.';
+    $('room-list').replaceChildren();
+    ['private-form', 'invite-form'].forEach(id => { $(id).querySelectorAll('input,button').forEach(control => { control.disabled = true; }); });
+    return;
+  }
+  $('rooms-status').textContent = 'Loading rooms…';
+  const payload = await api('/api/rooms');
+  $('room-list').replaceChildren();
+  payload.rooms.forEach(room => {
+    const card = document.createElement('article'), title = document.createElement('h3'), meta = document.createElement('p'), button = document.createElement('button');
+    title.textContent = room.name; meta.textContent = `${room.live} here now`;
+    button.type = 'button'; button.className = 'ghost'; button.textContent = room.slug === roomSlug ? 'Rejoin' : 'Join room';
+    button.setAttribute('aria-label', `Join ${room.name}`);
+    button.addEventListener('click', () => handle('room-error', () => enter(room.slug), button));
+    card.append(title, meta, button); $('room-list').appendChild(card);
   });
+  $('rooms-status').textContent = me ? 'Join a room to share your focus.' : 'Sign in to join a room.';
 }
 
-async function enter(slug, invite) {
+async function enter(slug, invite = undefined) {
+  if (mode !== 'server') throw new Error('Shared rooms need the Squeek Hours server.');
+  if (!me) { openAuth(); return; }
+  await api(`/api/rooms/${encodeURIComponent(slug)}/join`, { method: 'POST', body: { focus: $('room-focus').value, invite } });
+  const changed = roomSlug !== slug;
   roomSlug = slug;
-  await api(`/api/rooms/${slug}/join`, { method: "POST", body: { focus: $("room-focus").value, invite } });
-  $("room-panel").classList.remove("hidden");
+  $('room-panel').classList.remove('hidden');
   await paintRoom();
+  if (changed) $('room-name').focus();
 }
-
 async function paintRoom() {
   if (!roomSlug) return;
-  const payload = await api(`/api/rooms/${roomSlug}`);
-  $("room-name").textContent = payload.room.name;
-  $("room-goal").textContent = payload.room.goal || "No shared goal yet.";
-  const people = $("room-people");
-  people.replaceChildren();
-  payload.people.forEach((person) => {
-    const item = document.createElement("li");
-    item.textContent = `${person.username} · ${person.focus || "focused"}`;
-    people.appendChild(item);
+  const payload = await api(`/api/rooms/${encodeURIComponent(roomSlug)}`);
+  $('room-name').textContent = payload.room.name;
+  $('room-goal').textContent = payload.room.goal || 'No shared goal yet.';
+  $('room-people').replaceChildren();
+  (payload.people.length ? payload.people : [{ username: 'Nobody is in this room yet.', focus: '' }]).forEach(person => {
+    const li = document.createElement('li'); li.textContent = person.focus ? `${person.username} · ${person.focus}` : person.username; $('room-people').append(li);
   });
-  if (!payload.people.length) {
-    const item = document.createElement("li");
-    item.textContent = "Nobody is in this room yet.";
-    people.appendChild(item);
-  }
-  const log = $("room-log");
-  log.replaceChildren();
-  payload.messages.forEach((note) => {
-    const item = document.createElement("li");
-    item.textContent = `${note.username}: ${note.body}`;
-    log.appendChild(item);
+  const fragment = document.createDocumentFragment();
+  payload.messages.forEach(note => {
+    const li = document.createElement('li'); li.textContent = `${note.username}: ${note.body}`; fragment.append(li);
   });
+  if (!payload.messages.length) { const li = document.createElement('li'); li.textContent = 'No notes yet. Share what you are working on.'; fragment.append(li); }
+  $('room-log').replaceChildren(fragment);
+}
+async function heartbeat() {
+  if (!roomSlug || roomBusy || document.hidden) return;
+  roomBusy = true;
+  try { await enter(roomSlug); $('room-error').textContent = ''; }
+  catch (error) { $('room-error').textContent = `Room updates paused. ${error.message}`; }
+  finally { roomBusy = false; }
 }
 
 function paintWorld() {
-  if (!world) return;
-  $("world-name").textContent = world.name || "World unread";
-  const next = world.nextRound ? ` Next stage opens at settled round ${world.nextRound}.` : " This is the last stage.";
-  $("world-copy").textContent = world.reason
-    || `Stage ${world.stage} follows confirmed round ${world.settledRounds}. Provisional blocks do not unlock a stage.${next}`;
+  if (!world) {
+    $('world-name').textContent = 'Confirmed world progress unavailable';
+    $('world-copy').textContent = 'A world stage loads after a valid confirmed-state response. Refresh the chain on Home to try again.'; return;
+  }
+  $('world-name').textContent = world.name;
+  $('world-copy').textContent = `${chainReader.isStale('core') ? 'Stale snapshot · ' : ''}Stage ${world.stage} follows confirmed round ${formatted(world.settledRounds)}. Provisional blocks do not unlock a stage.${world.nextRound ? ` Next stage opens at confirmed round ${formatted(world.nextRound)}.` : ' This is the final stage.'}`;
 }
-
 async function loadExpedition() {
-  const payload = await api("/api/expedition");
-  const root = $("expedition");
-  root.replaceChildren();
-  const community = document.createElement("article");
-  community.innerHTML = "<h2>Community progress</h2>";
-  const communityText = document.createElement("p");
-  communityText.textContent = `${payload.community.sessions} / ${payload.mission.sessions} sessions, ${payload.community.people} / ${payload.mission.people} people, ${payload.community.minutes} / ${payload.mission.minutes} minutes, ${payload.community.consecutiveDays} / ${payload.mission.days} active days.`;
-  community.appendChild(communityText);
-  const hamster = document.createElement("article");
-  hamster.innerHTML = "<h2>Hamster progress</h2>";
-  const hamsterText = document.createElement("p");
-  hamsterText.textContent = payload.hamster.name
-    ? `${payload.hamster.name}, settled round ${payload.hamster.settledRounds}. This is chain progress, not focus minutes.`
-    : "Confirmed chain progress is unread.";
-  hamster.appendChild(hamsterText);
-  root.append(community, hamster);
+  const root = $('expedition'); root.replaceChildren();
+  const community = document.createElement('article'), heading = document.createElement('h3'), copy = document.createElement('p');
+  heading.textContent = 'Community progress'; community.append(heading, copy);
+  copy.textContent = mode === 'server' ? 'Loading shared progress…' : 'Shared expedition totals need the Squeek Hours server. Device sessions stay separate.';
+  root.append(community);
+  const hamster = document.createElement('article'), title = document.createElement('h3'), text = document.createElement('p');
+  title.textContent = 'Hamster progress';
+  text.textContent = world ? `${world.name} · confirmed round ${formatted(world.settledRounds)}${chainReader.isStale('core') ? ' · stale snapshot' : ''}. This is chain progress, not focus minutes.` : 'Confirmed chain progress unavailable.';
+  hamster.append(title, text); root.append(hamster);
+  if (mode === 'server') {
+    const payload = await api('/api/expedition');
+    const c = payload.community, m = payload.mission;
+    const done = c.sessions >= m.sessions && c.people >= m.people && c.minutes >= m.minutes && c.consecutiveDays >= m.days;
+    copy.textContent = `${done ? 'Mission complete · ' : ''}${c.sessions} / ${m.sessions} sessions · ${c.people} / ${m.people} people · ${c.minutes} / ${m.minutes} minutes · ${c.consecutiveDays} / ${m.days} consecutive active days (UTC).`;
+  }
 }
-
 async function loadBoard() {
-  const payload = await api("/api/leaderboard");
-  const list = $("leaders");
-  list.replaceChildren();
-  if (!payload.leaders.length) {
-    const item = document.createElement("li");
-    item.textContent = "No finished sessions yet.";
-    list.appendChild(item);
-    return;
-  }
-  payload.leaders.forEach((leader) => {
-    const item = document.createElement("li");
-    item.textContent = `${leader.username} · ${leader.level} · ${leader.xp} XP · ${leader.minutes} min · streak ${leader.streak}`;
-    list.appendChild(item);
+  const list = $('leaders'); list.replaceChildren();
+  if (mode !== 'server') { $('board-note').textContent = 'The shared league needs the Squeek Hours server. Device XP is personal and is never submitted as a shared score.'; return; }
+  $('board-note').textContent = 'Loading shared rankings…';
+  const payload = await api('/api/leaderboard');
+  $('board-note').textContent = 'Ranks come from finished sessions on this server. Focus XP is not SQK.';
+  if (!payload.leaders.length) { const li = document.createElement('li'); li.textContent = 'No finished sessions yet. Complete a focus session to enter the league.'; list.append(li); }
+  payload.leaders.forEach(leader => {
+    const li = document.createElement('li'); li.textContent = `${leader.username} · ${leader.level} · ${leader.xp} XP · ${leader.minutes} min · streak ${leader.streak}`; list.append(li);
   });
 }
-
+function clearPrivateViews() {
+  ['themes', 'badges', 'room-people', 'room-log', 'private-result'].forEach(id => $(id).replaceChildren());
+  $('room-panel').classList.add('hidden'); $('share').disabled = true;
+  $('device-profile').classList.add('hidden'); $('profile-stats').textContent = ''; $('profile-scope').textContent = '';
+  ['room-focus', 'room-text', 'invite-slug', 'invite-code'].forEach(id => { $(id).value = ''; });
+  paintProfile();
+}
 function paintProfile() {
-  if (!me?.user) {
-    $("profile-name").textContent = "Sign in to keep a profile";
-    $("profile-stats").textContent = "";
-    return;
-  }
+  if (!me?.user) { $('profile-name').textContent = 'Sign in to keep a profile'; $('profile-stats').textContent = 'Use Sign in to save focus sessions to your account.'; $('themes').replaceChildren(); $('badges').replaceChildren(); $('share').disabled = true; return; }
   const stats = me.stats;
-  $("profile-name").textContent = me.user.username;
-  $("profile-stats").textContent = `${stats.level} · ${stats.xp} XP · ${stats.minutes} minutes · ${stats.sessions} sessions · streak ${stats.streak} · best ${stats.best}`;
-  const themes = $("themes");
-  themes.replaceChildren();
-  me.themes.forEach((theme) => {
-    const button = document.createElement("button");
-    button.type = "button";
+  $('profile-name').textContent = me.user.username;
+  $('profile-scope').textContent = mode === 'device' ? 'Saved in this browser only. Clearing site data removes this profile. Device XP is not a shared score.' : 'Saved on the Squeek Hours server. Early Bird and Night Owl use UTC.';
+  $('device-profile').classList.toggle('hidden', mode !== 'device');
+  if (document.activeElement !== $('device-name')) $('device-name').value = me.user.username;
+  $('profile-stats').textContent = `${stats.level} · ${stats.xp} XP · ${stats.minutes} minutes · ${stats.sessions} sessions · streak ${stats.streak} · best ${stats.best}`;
+  $('share').disabled = false; $('themes').replaceChildren();
+  me.themes.forEach(theme => {
+    const button = document.createElement('button'); button.type = 'button';
     button.textContent = theme.open ? theme.id : `${theme.id} · ${theme.xp} XP`;
-    button.disabled = !theme.open;
-    button.className = me.user.theme === theme.id ? "" : "ghost";
-    button.addEventListener("click", async () => {
-      await api("/api/theme", { method: "POST", body: { theme: theme.id } });
-      await refreshMe();
-      paintProfile();
-    });
-    themes.appendChild(button);
+    button.disabled = !theme.open; button.className = 'ghost'; button.setAttribute('aria-pressed', String(me.user.theme === theme.id));
+    button.addEventListener('click', () => handle('page-error', async () => {
+      if (mode === 'device') await device.profile(undefined, theme.id);
+      else await api('/api/theme', { method: 'POST', body: { theme: theme.id } });
+      await refreshMe(); paintProfile();
+    })); $('themes').append(button);
   });
-  const badges = $("badges");
-  badges.replaceChildren();
-  me.achievements.forEach((badge) => {
-    const item = document.createElement("li");
-    item.textContent = badge.earned ? badge.name : `${badge.name} — still open`;
-    badges.appendChild(item);
+  $('badges').replaceChildren();
+  me.achievements.forEach(badge => {
+    const li = document.createElement('li'); li.textContent = `${badge.name} · ${badge.earned ? 'earned' : mode === 'device' && ['Community Builder', 'Expedition Pioneer'].includes(badge.name) ? 'shared service only' : 'not earned yet'}`; $('badges').append(li);
   });
 }
-
 function shareCard() {
-  const canvas = document.createElement("canvas");
-  canvas.width = 1200;
-  canvas.height = 675;
-  const pen = canvas.getContext("2d");
-  pen.fillStyle = "#090d16";
-  pen.fillRect(0, 0, 1200, 675);
-  pen.fillStyle = "#a6ff5b";
-  pen.font = "64px Georgia";
-  pen.fillText("SQUEEK HOURS", 64, 140);
-  pen.fillStyle = "#f5f7fa";
-  pen.font = "36px Segoe UI";
-  const name = me?.user?.username || "Guest";
-  const minutes = me?.stats?.minutes || 0;
-  const sessions = me?.stats?.sessions || 0;
-  pen.fillText(`${name} · ${minutes} focus minutes`, 64, 260);
-  pen.fillText(`${sessions} sessions · ${me?.stats?.level || "Bronze"}`, 64, 320);
-  pen.fillStyle = "#49d9cf";
-  pen.fillText("Squeekchain keeps the chain. People keep the hours.", 64, 460);
-  const link = document.createElement("a");
-  link.href = canvas.toDataURL("image/png");
-  link.download = "squeek-hours.png";
-  link.click();
+  if (!me) return;
+  const canvas = document.createElement('canvas'); canvas.width = 1200; canvas.height = 675;
+  const pen = canvas.getContext('2d');
+  pen.fillStyle = '#090d16'; pen.fillRect(0, 0, 1200, 675);
+  pen.fillStyle = '#a6ff5b'; pen.font = '64px Georgia'; pen.fillText('SQUEEK HOURS', 64, 140);
+  pen.fillStyle = '#f5f7fa'; pen.font = '36px sans-serif';
+  pen.fillText(`${me.user.username} · ${me.stats.minutes} focus minutes`, 64, 260);
+  pen.fillText(`${me.stats.sessions} sessions · ${me.stats.level} · ${me.stats.xp} XP`, 64, 320);
+  pen.fillStyle = '#49d9cf'; pen.font = '28px sans-serif';
+  pen.fillText(mode === 'device' ? 'Device profile · personal records, not a shared ranking' : 'Squeek Hours server profile', 64, 450);
+  pen.fillText('Focus XP is not SQK.', 64, 510);
+  const link = document.createElement('a'); link.href = canvas.toDataURL('image/png'); link.download = 'squeek-hours.png'; link.click();
 }
 
-document.querySelectorAll("nav button").forEach((button) => {
-  button.addEventListener("click", () => show(button.dataset.view));
-});
-$("start-25").addEventListener("click", () => start("25").catch((error) => { $("session-note").textContent = error.message; }));
-$("start-50").addEventListener("click", () => start("50").catch((error) => { $("session-note").textContent = error.message; }));
-$("cancel").addEventListener("click", async () => {
+function navigate(name) {
+  if (location.hash === `#${name}`) show(name, true);
+  else location.hash = name;
+}
+for (const button of document.querySelectorAll('nav button')) button.addEventListener('click', () => navigate(/** @type {HTMLElement} */ (button).dataset.view));
+window.addEventListener('hashchange', () => { if (location.hash !== '#main') show(location.hash.slice(1), true); });
+$('start-25').addEventListener('click', () => handle('session-note', () => start('25')));
+$('start-50').addEventListener('click', () => handle('session-note', () => start('50')));
+$('custom-form').addEventListener('submit', event => { event.preventDefault(); handle('session-note', () => start('custom', Number($('custom-minutes').value))); });
+$('cancel').addEventListener('click', () => handle('session-note', async () => {
   if (!active) return;
-  await api(`/api/sessions/${active.id}/cancel`, { method: "POST", body: {} });
-  active = null;
-  paintSession();
-  paintChain();
-});
-$("auth-open").addEventListener("click", async () => {
-  if (me?.user) {
-    await api("/api/logout", { method: "POST", body: {} });
-    me = null;
-    active = null;
-    roomSlug = "";
-    await refreshMe();
-    return;
-  }
-  $("auth").showModal();
-});
-$("auth-close").addEventListener("click", () => $("auth").close());
-$("auth-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  await sendAuth("/api/login");
-});
-$("register").addEventListener("click", () => sendAuth("/api/register"));
-$("room-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  if (!roomSlug) return;
-  await api(`/api/rooms/${roomSlug}/messages`, { method: "POST", body: { body: $("room-text").value } });
-  $("room-text").value = "";
-  await paintRoom();
-});
-$("room-focus").addEventListener("change", () => {
-  if (roomSlug) enter(roomSlug).catch(() => {});
-});
-$("private-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const payload = await api("/api/rooms", { method: "POST", body: { name: $("private-name").value, goal: $("private-goal").value } });
-  $("private-result").textContent = `Code ${payload.slug} · invite ${payload.invite}`;
-});
-$("invite-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  await enter($("invite-slug").value.trim(), $("invite-code").value.trim());
-});
-$("share").addEventListener("click", shareCard);
-
+  if (!confirm('Cancel this session? Unfinished minutes earn no XP.')) return;
+  if (mode === 'device') await device.cancel(active.id);
+  else await api(`/api/sessions/${active.id}/cancel`, { method: 'POST', body: {} });
+  active = null; await refreshMe(); $('session-note').textContent = 'Session cancelled. No XP was added.';
+}, $('cancel')));
+$('auth-open').addEventListener('click', () => handle('page-error', async () => {
+  if (mode === 'server' && me?.user) {
+    await api('/api/logout', { method: 'POST', body: {} });
+    me = null; active = null; roomSlug = ''; clearPrivateViews();
+    await refreshMe(); $('session-note').textContent = 'Signed out. Any running session stays on your account.';
+  } else openAuth();
+}));
+$('auth-close').addEventListener('click', () => $('auth').close());
+$('auth').addEventListener('close', () => { $('auth-form').reset(); if (authReturn?.isConnected) authReturn.focus(); });
 async function sendAuth(path) {
-  const form = new FormData($("auth-form"));
-  try {
-    await api(path, { method: "POST", body: { username: form.get("username"), password: form.get("password") } });
-    $("auth-error").textContent = "";
-    $("auth").close();
-    await refreshMe();
-  } catch (error) {
-    $("auth-error").textContent = error.message;
-  }
+  const form = $('auth-form');
+  if (!form.reportValidity()) return;
+  const buttons = form.querySelectorAll('button:not(#auth-close)'); buttons.forEach(button => { button.disabled = true; });
+  await handle('auth-error', async () => {
+    const data = new FormData(form);
+    await api(path, { method: 'POST', body: { username: data.get('username'), password: data.get('password') } });
+    $('auth').close(); await refreshMe();
+    $('session-note').textContent = active ? $('session-note').textContent : 'Signed in. Choose a session to begin.';
+    if (currentView === 'rooms') await loadRooms();
+  });
+  buttons.forEach(button => { button.disabled = false; });
 }
+$('auth-form').addEventListener('submit', event => { event.preventDefault(); sendAuth('/api/login'); });
+$('register').addEventListener('click', () => sendAuth('/api/register'));
+$('room-form').addEventListener('submit', event => { event.preventDefault(); handle('room-error', async () => {
+  if (!roomSlug) throw new Error('Join a room first.');
+  await api(`/api/rooms/${encodeURIComponent(roomSlug)}/messages`, { method: 'POST', body: { body: $('room-text').value } });
+  $('room-text').value = ''; await paintRoom();
+}, $('room-form').querySelector('button')); });
+$('room-focus').addEventListener('change', () => { if (roomSlug) handle('room-error', () => enter(roomSlug)); });
+$('room-leave').addEventListener('click', () => handle('room-error', async () => {
+  await api('/api/rooms/leave', { method: 'POST', body: {} }); roomSlug = ''; $('room-panel').classList.add('hidden'); await loadRooms();
+}));
+$('room-start').addEventListener('click', () => { navigate('home'); handle('session-note', () => start('25')); });
+$('private-form').addEventListener('submit', event => { event.preventDefault(); handle('room-error', async () => {
+  if (!me) { openAuth(); return; }
+  const payload = await api('/api/rooms', { method: 'POST', body: { name: $('private-name').value, goal: $('private-goal').value } });
+  $('private-result').textContent = `Room code: ${payload.slug} · invite: ${payload.invite}. Share both privately.`;
+  $('invite-slug').value = payload.slug; $('invite-code').value = payload.invite;
+  await enter(payload.slug, payload.invite);
+}, $('private-form').querySelector('button')); });
+$('invite-form').addEventListener('submit', event => { event.preventDefault(); handle('room-error', () => enter($('invite-slug').value.trim(), $('invite-code').value.trim()), $('invite-form').querySelector('button')); });
+$('device-profile').addEventListener('submit', event => { event.preventDefault(); handle('page-error', async () => { await device.profile($('device-name').value); await refreshMe(); $('page-error').textContent = 'Display name saved on this device.'; }); });
+$('share').addEventListener('click', shareCard);
+$('chain-retry').addEventListener('click', () => handle('page-error', refreshChain, $('chain-retry')));
+window.addEventListener('storage', () => { if (mode === 'device') handle('page-error', async () => { await refreshMe(); await refreshToday(); }); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden && mode !== 'loading') { handle('page-error', refreshMe); refreshChain(); } });
 
-show("home");
-refreshChain().catch(() => { $("chain-state").textContent = "UNAVAILABLE"; });
-refreshMe().catch(() => {});
-refreshToday().catch(() => {});
-setInterval(() => refreshChain().catch(() => {}), 8000);
-setInterval(() => refreshToday().catch(() => {}), 8000);
-setInterval(() => {
-  if (active) {
-    active.remaining = Math.max(0, active.remaining - 1);
-    paintSession();
-    if (active.remaining === 0) refreshMe().catch(() => {});
-  }
-}, 1000);
-setInterval(() => {
-  if (roomSlug && !document.getElementById("view-rooms").classList.contains("hidden")) {
-    enter(roomSlug).catch(() => {});
-  }
-}, 4000);
+async function init() {
+  paintSession();
+  const runtime = await api('/runtime.json');
+  if (!['server', 'device'].includes(runtime.mode)) throw new Error('Unknown runtime mode. Reload the site or check its runtime.json.');
+  mode = runtime.mode;
+  if (mode === 'device') device = new DeviceStore();
+  $('service-note').textContent = mode === 'device' ? 'Device mode · sessions saved in this browser.' : 'Shared service · accounts, rooms and sessions saved on this server.';
+  $('session-note').textContent = mode === 'device' ? 'Choose a session. Device XP stays personal.' : 'Sign in, then choose a session. Leaving the tab keeps your timer running.';
+  await refreshMe(); await refreshToday();
+  show(location.hash.slice(1) || 'home');
+}
+show('home');
+refreshChain();
+handle('page-error', init);
+const background = action => action().catch(error => { $('page-error').textContent = error.message; });
+setInterval(() => { paintChain(); if (active) { paintSession(); if (!remaining()) background(refreshMe); } }, 1000);
+setInterval(() => { if (!document.hidden) refreshChain(); }, 8000);
+setInterval(() => { if (!document.hidden && mode !== 'loading') background(async () => { await refreshMe(); await refreshToday(); if (currentView === 'board') await loadBoard(); }); }, 8000);
+setInterval(heartbeat, 4000);

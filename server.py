@@ -1,6 +1,9 @@
 """SQUEEK HOURS. Stdlib server: accounts, focus sessions, live rooms, chain proxy."""
 
+import argparse
 import hashlib
+import hmac
+import math
 import json
 import mimetypes
 import secrets
@@ -13,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
+from squeekchain import fetch_chain, world_from
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "public"
@@ -20,6 +24,7 @@ DB_PATH = ROOT / "data" / "app.db"
 API = "https://api.squeekchain.com"
 CHAIN_ID = "11155111"
 PORT = 4183
+SECURE_COOKIES = False
 
 STAGES = [
     (0, "The First Burrow"),
@@ -47,8 +52,6 @@ PUBLIC_ROOMS = [
 THEMES = [("burrow", 0), ("lamp", 100), ("studio", 300), ("crystal", 800)]
 
 lock = threading.Lock()
-chain_lock = threading.Lock()
-chain_cache = {"at": 0, "etag": None, "body": None, "error": None, "retry_at": 0}
 
 
 def now():
@@ -64,7 +67,7 @@ def parse_time(value):
         return None
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+    except (ValueError, TypeError, AttributeError):
         return None
 
 
@@ -107,6 +110,11 @@ def init_db():
               room_id INTEGER NOT NULL,
               focus TEXT NOT NULL DEFAULT '',
               seen_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS room_members (
+              user_id INTEGER NOT NULL,
+              room_id INTEGER NOT NULL,
+              PRIMARY KEY (user_id, room_id)
             );
             CREATE TABLE IF NOT EXISTS messages (
               id INTEGER PRIMARY KEY,
@@ -159,9 +167,9 @@ def user_from_request(connection, headers):
         """
         SELECT users.* FROM auth_sessions
         JOIN users ON users.id = auth_sessions.user_id
-        WHERE auth_sessions.token_hash = ?
+        WHERE auth_sessions.token_hash = ? AND auth_sessions.created_at >= ?
         """,
-        (token_hash(token),),
+        (token_hash(token), iso(now() - timedelta(days=30))),
     ).fetchone()
     return row
 
@@ -264,14 +272,27 @@ def settle_active(connection, user_id):
             (iso(end), row["id"]),
         )
         return None
-    remaining = int((end - now()).total_seconds())
+    remaining = max(0, math.ceil((end - now()).total_seconds()))
     return {
         "id": row["id"],
         "kind": row["kind"],
         "plannedSeconds": row["planned_seconds"],
         "remaining": max(0, remaining),
         "roomId": row["room_id"],
+        "startedAt": row["started_at"],
     }
+
+
+def settle_due(connection):
+    users = connection.execute("SELECT DISTINCT user_id FROM focus_sessions WHERE status = 'active'").fetchall()
+    for row in users:
+        settle_active(connection, row['user_id'])
+
+
+def can_read_room(connection, user, room):
+    return room['kind'] == 'public' or bool(user and (room['owner_id'] == user['id'] or connection.execute(
+        'SELECT 1 FROM room_members WHERE user_id = ? AND room_id = ?', (user['id'], room['id'])
+    ).fetchone()))
 
 
 def community(connection):
@@ -311,115 +332,6 @@ def community(connection):
     }
 
 
-def world_from(chain):
-    if not chain or chain.get("visual") == "UNAVAILABLE" and chain.get("round") is None:
-        return {"stage": None, "name": None, "nextRound": None, "reason": "chain unread"}
-    round_no = int(chain["round"])
-    current = STAGES[0][1]
-    next_round = STAGES[1][0]
-    index = 1
-    for number, (floor, name) in enumerate(STAGES, start=1):
-        if round_no >= floor:
-            current = name
-            index = number
-            nxt = STAGES[number][0] if number < len(STAGES) else None
-            next_round = nxt
-    return {
-        "stage": index,
-        "name": current,
-        "settledRounds": round_no,
-        "nextRound": next_round,
-        "provisionalGlow": bool(chain.get("blockProgress")),
-    }
-
-
-def fetch_chain():
-    with chain_lock:
-        moment = time.time()
-        if chain_cache["retry_at"] > moment and chain_cache["body"]:
-            return chain_cache["body"], chain_cache["error"]
-        if chain_cache["body"] and moment - chain_cache["at"] < 8:
-            return chain_cache["body"], None
-        request = urllib.request.Request(API + "/v1/status", headers={"Accept": "application/json"})
-        if chain_cache["etag"]:
-            request.add_header("If-None-Match", chain_cache["etag"])
-        try:
-            with urllib.request.urlopen(request, timeout=8) as response:
-                if response.status == 304 and chain_cache["body"]:
-                    chain_cache["at"] = moment
-                    return chain_cache["body"], None
-                payload = json.loads(response.read().decode())
-                chain_cache["etag"] = response.headers.get("ETag")
-                interpreted = interpret(payload)
-                chain_cache.update(at=moment, body=interpreted, error=None, retry_at=0)
-                return interpreted, None
-        except urllib.error.HTTPError as error:
-            wait = int(error.headers.get("Retry-After") or "8")
-            chain_cache["retry_at"] = moment + max(1, wait)
-            chain_cache["error"] = f"HTTP {error.code}"
-            if chain_cache["body"]:
-                return chain_cache["body"], chain_cache["error"]
-            return interpret(None), chain_cache["error"]
-        except Exception:
-            chain_cache["error"] = "unread"
-            if chain_cache["body"]:
-                return chain_cache["body"], "unread"
-            return interpret(None), "unread"
-
-
-def interpret(payload):
-    empty = {
-        "visual": "UNAVAILABLE",
-        "settlement": "UNAVAILABLE",
-        "round": None,
-        "work": None,
-        "blockHeight": None,
-        "blockProgress": None,
-        "rpm": None,
-        "pendingRound": None,
-        "chainId": None,
-        "installationId": None,
-        "reason": "Squeekchain status is unread. Missing data is not zero activity.",
-    }
-    if not isinstance(payload, dict) or payload.get("schemaVersion") != 1:
-        return empty
-    chain = str((payload.get("builder") or {}).get("status") or "")
-    measurement = payload.get("measurement") or {}
-    anchor = (payload.get("builder") or {}).get("anchor") or {}
-    if not anchor.get("settledThroughRound"):
-        empty["reason"] = "Confirmed settlement is missing."
-        return empty
-    observed = parse_time(measurement.get("observedAt"))
-    limit = float(measurement.get("staleAfterSeconds") or 120)
-    fresh = measurement.get("freshness") == "online" and observed and (now() - observed).total_seconds() < limit
-    status = measurement.get("coreStatus")
-    if not fresh or not status:
-        visual = "UNAVAILABLE"
-    elif status == "ACTIVE":
-        visual = "LIVE"
-    elif status == "IDLE":
-        visual = "RESTING"
-    else:
-        visual = "UNAVAILABLE"
-    submission = (payload.get("settlementQueue") or {}).get("latestSubmission") or {}
-    confirmed = submission.get("lifecycle") == "confirmed" and str(submission.get("settledThroughRound")) == str(anchor.get("settledThroughRound"))
-    pending = submission.get("settledThroughRound") if submission and not confirmed else None
-    settlement = "SETTLING" if pending else "CONFIRMED"
-    return {
-        "visual": visual,
-        "settlement": settlement,
-        "round": str(anchor.get("settledThroughRound")),
-        "work": str(anchor.get("cumulativeWork")),
-        "blockHeight": str(anchor.get("blockHeight")),
-        "blockProgress": str(anchor.get("blockProgress") or "0"),
-        "rpm": (float(measurement.get("rpmMilli") or 0) / 1000) if fresh else None,
-        "pendingRound": str(pending) if pending else None,
-        "chainId": CHAIN_ID,
-        "installationId": payload.get("installationId"),
-        "builder": chain,
-        "reason": None if visual != "UNAVAILABLE" else "Fresh activity is not available. The hamster is not shown as resting.",
-    }
-
 
 class App(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -431,32 +343,42 @@ class App(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        secure = '; Secure' if SECURE_COOKIES else ''
         if cookie:
-            self.send_header("Set-Cookie", f"sqh_session={cookie}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000")
+            self.send_header("Set-Cookie", f"sqh_session={cookie}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000{secure}")
         if clear:
-            self.send_header("Set-Cookie", "sqh_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0")
+            self.send_header("Set-Cookie", f"sqh_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{secure}")
         self.end_headers()
         self.wfile.write(body)
 
     def read_json(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        if length > 8000:
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return None
+        if length < 0 or length > 8000:
             return None
         if length == 0:
             return {}
         try:
-            return json.loads(self.rfile.read(length).decode())
-        except json.JSONDecodeError:
+            payload = json.loads(self.rfile.read(length).decode())
+            return payload if isinstance(payload, dict) else None
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return None
 
     def do_GET(self):
         path = urlparse(self.path).path
+        if path == '/runtime.json':
+            self.send_json(200, {'mode': 'server'})
+            return
         if path.startswith("/api/"):
             self.api_get(path)
             return
         file_path = STATIC / "index.html" if path in ("/", "") else STATIC / path.lstrip("/")
-        if not str(file_path.resolve()).startswith(str(STATIC.resolve())) or not file_path.is_file():
-            file_path = STATIC / "index.html"
+        if not file_path.resolve().is_relative_to(STATIC.resolve()) or not file_path.is_file():
+            self.send_json(404, {"error": "Not found"})
+            return
         data = file_path.read_bytes()
         mime = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
         self.send_response(200)
@@ -467,6 +389,13 @@ class App(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_POST(self):
+        origin = self.headers.get('Origin')
+        if origin and urlparse(origin).netloc != self.headers.get('Host'):
+            self.send_json(403, {'error': 'Cross-origin account requests are not allowed.'})
+            return
+        if 'application/json' not in self.headers.get('Content-Type', ''):
+            self.send_json(415, {'error': 'Use application/json.'})
+            return
         path = urlparse(self.path).path
         payload = self.read_json()
         if payload is None:
@@ -477,30 +406,40 @@ class App(BaseHTTPRequestHandler):
             try:
                 self.api_post(connection, path, payload)
                 connection.commit()
+            except (ValueError, TypeError, OverflowError):
+                connection.rollback()
+                self.send_json(400, {"error": "Invalid request values."})
             finally:
                 connection.close()
 
     def api_get(self, path):
+        if path == '/api/health':
+            self.send_json(200, {'application': 'squeek-hours', 'version': 1})
+            return
         if path == "/api/chain":
             body, error = fetch_chain()
             self.send_json(200, {"chain": body, "warning": error, "world": world_from(body)})
             return
+        # External reads must never hold the database lock used by accounts and timers.
+        expedition_chain = fetch_chain()[0] if path == '/api/expedition' else None
         with lock:
             connection = db()
             try:
                 user = user_from_request(connection, self.headers)
+                settle_due(connection)
                 if path == "/api/me":
                     self.me(connection, user)
                 elif path == "/api/rooms":
                     self.rooms(connection)
                 elif path.startswith("/api/rooms/"):
-                    self.room_detail(connection, path.split("/")[-1])
+                    self.room_detail(connection, path.split("/")[-1], user)
                 elif path == "/api/leaderboard":
                     self.board(connection)
                 elif path == "/api/expedition":
-                    self.expedition(connection)
+                    self.expedition(connection, expedition_chain)
                 else:
                     self.send_json(404, {"error": "Not found"})
+                connection.commit()
             finally:
                 connection.close()
 
@@ -515,6 +454,7 @@ class App(BaseHTTPRequestHandler):
             "stats": info,
             "achievements": badges,
             "active": active,
+            "serverNow": iso(now()),
             "themes": [{"id": name, "xp": need, "open": info["xp"] >= need} for name, need in THEMES],
         })
 
@@ -529,10 +469,13 @@ class App(BaseHTTPRequestHandler):
         ).fetchall()
         self.send_json(200, {"rooms": [dict(row) for row in rows]})
 
-    def room_detail(self, connection, slug):
+    def room_detail(self, connection, slug, user):
         room = connection.execute("SELECT * FROM rooms WHERE slug = ?", (slug,)).fetchone()
         if not room:
             self.send_json(404, {"error": "No such room"})
+            return
+        if not can_read_room(connection, user, room):
+            self.send_json(403, {'error': 'Join with a valid invite to read this private room.'})
             return
         cutoff = iso(now() - timedelta(seconds=20))
         people = connection.execute(
@@ -552,7 +495,8 @@ class App(BaseHTTPRequestHandler):
             """,
             (room["id"],),
         ).fetchall()
-        self.send_json(200, {"room": dict(room), "people": [dict(row) for row in people], "messages": [dict(row) for row in reversed(notes)]})
+        safe_room = {key: room[key] for key in ('id', 'slug', 'name', 'kind', 'goal')}
+        self.send_json(200, {"room": safe_room, "people": [dict(row) for row in people], "messages": [dict(row) for row in reversed(notes)]})
 
     def board(self, connection):
         users = connection.execute("SELECT id, username, theme FROM users").fetchall()
@@ -562,12 +506,11 @@ class App(BaseHTTPRequestHandler):
             if info["sessions"] == 0:
                 continue
             ranked.append({"username": user["username"], "theme": user["theme"], **info})
-        ranked.sort(key=lambda item: (item["xp"], item["minutes"]), reverse=True)
+        ranked.sort(key=lambda item: (-item["xp"], -item["minutes"], item['username']))
         self.send_json(200, {"leaders": ranked[:50]})
 
-    def expedition(self, connection):
+    def expedition(self, connection, chain):
         facts = community(connection)
-        chain, _error = fetch_chain()
         self.send_json(200, {
             "mission": MISSION,
             "community": facts,
@@ -594,6 +537,12 @@ class App(BaseHTTPRequestHandler):
             self.join_room(connection, user, path.split("/")[3], payload)
         elif path.endswith("/messages") and path.startswith("/api/rooms/"):
             self.post_message(connection, user, path.split("/")[3], payload)
+        elif path == '/api/rooms/leave':
+            if not user:
+                self.send_json(401, {'error': 'Sign in.'})
+                return
+            connection.execute('DELETE FROM presence WHERE user_id = ?', (user['id'],))
+            self.send_json(200, {'ok': True})
         elif path == "/api/rooms":
             self.create_room(connection, user, payload)
         else:
@@ -605,8 +554,8 @@ class App(BaseHTTPRequestHandler):
         if not username.replace("_", "").isalnum() or not 3 <= len(username) <= 20:
             self.send_json(400, {"error": "Username must be 3–20 letters, numbers, or underscores."})
             return
-        if len(password) < 8:
-            self.send_json(400, {"error": "Password must be at least 8 characters."})
+        if not 8 <= len(password) <= 256:
+            self.send_json(400, {"error": "Password must be 8–256 characters."})
             return
         if connection.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone():
             self.send_json(409, {"error": "That username is taken."})
@@ -621,17 +570,21 @@ class App(BaseHTTPRequestHandler):
     def login(self, connection, payload):
         username = str(payload.get("username") or "")
         password = str(payload.get("password") or "")
+        if len(password) > 256:
+            self.send_json(400, {'error': 'Password is too long.'})
+            return
         row = connection.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
         if not row:
             self.send_json(401, {"error": "Wrong username or password."})
             return
         _salt, digest = hash_password(password, row["salt"])
-        if digest != row["password_hash"]:
+        if not hmac.compare_digest(digest, row["password_hash"]):
             self.send_json(401, {"error": "Wrong username or password."})
             return
         self.issue(connection, username)
 
     def issue(self, connection, username):
+        connection.execute('DELETE FROM auth_sessions WHERE created_at < ?', (iso(now() - timedelta(days=30)),))
         user = connection.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
         token = secrets.token_urlsafe(32)
         connection.execute(
@@ -641,6 +594,9 @@ class App(BaseHTTPRequestHandler):
         self.send_json(200, {"ok": True, "username": username}, cookie=token)
 
     def logout(self, connection):
+        user = user_from_request(connection, self.headers)
+        if user:
+            connection.execute('DELETE FROM presence WHERE user_id = ?', (user['id'],))
         cookie = self.headers.get("Cookie", "")
         for part in cookie.split(";"):
             name, _, value = part.strip().partition("=")
@@ -661,7 +617,10 @@ class App(BaseHTTPRequestHandler):
         elif kind == "50":
             seconds = 50 * 60
         elif kind == "custom":
-            minutes = int(payload.get("minutes") or 0)
+            minutes = payload.get('minutes')
+            if not isinstance(minutes, int) or isinstance(minutes, bool):
+                self.send_json(400, {'error': 'Custom duration must be a whole number of minutes.'})
+                return
             if minutes < 1 or minutes > 120:
                 self.send_json(400, {"error": "Custom sessions are 1 to 120 minutes."})
                 return
@@ -672,8 +631,11 @@ class App(BaseHTTPRequestHandler):
         room_id = None
         slug = payload.get("room")
         if slug:
-            room = connection.execute("SELECT id FROM rooms WHERE slug = ?", (str(slug),)).fetchone()
-            room_id = room["id"] if room else None
+            room = connection.execute("SELECT * FROM rooms WHERE slug = ?", (str(slug),)).fetchone()
+            if not room or not can_read_room(connection, user, room):
+                self.send_json(403, {'error': 'Join this room before starting a session in it.'})
+                return
+            room_id = room['id']
         stamp = iso(now())
         cursor = connection.execute(
             """
@@ -682,22 +644,25 @@ class App(BaseHTTPRequestHandler):
             """,
             (user["id"], room_id, kind, seconds, stamp, stamp),
         )
-        self.send_json(200, {"id": cursor.lastrowid, "remaining": seconds})
+        self.send_json(200, {"id": cursor.lastrowid, "kind": kind, "remaining": seconds, 'plannedSeconds': seconds, 'startedAt': stamp, 'serverNow': stamp})
 
     def finish_session(self, connection, user, session_id):
         if not user:
             self.send_json(401, {"error": "Sign in."})
             return
         row = connection.execute(
-            "SELECT * FROM focus_sessions WHERE id = ? AND user_id = ? AND status = 'active'",
+            "SELECT * FROM focus_sessions WHERE id = ? AND user_id = ? AND status IN ('active', 'completed')",
             (session_id, user["id"]),
         ).fetchone()
         if not row:
             self.send_json(404, {"error": "No active session."})
             return
+        if row['status'] == 'completed':
+            self.send_json(200, {'ok': True, 'xp': xp_for(row['kind'], row['planned_seconds']), 'minutes': row['planned_seconds'] // 60})
+            return
         started = parse_time(row["started_at"])
         elapsed = (now() - started).total_seconds()
-        if elapsed + 2 < row["planned_seconds"]:
+        if elapsed < row["planned_seconds"]:
             self.send_json(400, {"error": "This session has not finished yet."})
             return
         ended = iso(started + timedelta(seconds=row["planned_seconds"]))
@@ -711,10 +676,14 @@ class App(BaseHTTPRequestHandler):
         if not user:
             self.send_json(401, {"error": "Sign in."})
             return
-        connection.execute(
+        settle_active(connection, user['id'])
+        result = connection.execute(
             "UPDATE focus_sessions SET status = 'cancelled', ended_at = ? WHERE id = ? AND user_id = ? AND status = 'active'",
             (iso(now()), session_id, user["id"]),
         )
+        if result.rowcount == 0:
+            self.send_json(409, {'error': 'This session already ended or does not belong to your account. Refresh your profile.'})
+            return
         self.send_json(200, {"ok": True})
 
     def set_theme(self, connection, user, payload):
@@ -738,9 +707,11 @@ class App(BaseHTTPRequestHandler):
         if not room:
             self.send_json(404, {"error": "No such room"})
             return
-        if room["kind"] == "private" and payload.get("invite") != room["invite"]:
+        if not can_read_room(connection, user, room) and payload.get("invite") != room["invite"]:
             self.send_json(403, {"error": "Invite code required."})
             return
+        if room['kind'] == 'private':
+            connection.execute('INSERT OR IGNORE INTO room_members (user_id, room_id) VALUES (?, ?)', (user['id'], room['id']))
         focus = str(payload.get("focus") or "")[:80]
         connection.execute(
             """
@@ -755,17 +726,20 @@ class App(BaseHTTPRequestHandler):
         if not user:
             self.send_json(401, {"error": "Sign in to talk."})
             return
-        room = connection.execute("SELECT id FROM rooms WHERE slug = ?", (slug,)).fetchone()
+        room = connection.execute("SELECT * FROM rooms WHERE slug = ?", (slug,)).fetchone()
         if not room:
             self.send_json(404, {"error": "No such room"})
+            return
+        if not can_read_room(connection, user, room):
+            self.send_json(403, {'error': 'Join with a valid invite first.'})
             return
         body = " ".join(str(payload.get("body") or "").split())
         if not body or len(body) > 140:
             self.send_json(400, {"error": "Messages are 1–140 characters."})
             return
         present = connection.execute(
-            "SELECT 1 FROM presence WHERE user_id = ? AND room_id = ?",
-            (user["id"], room["id"]),
+            "SELECT 1 FROM presence WHERE user_id = ? AND room_id = ? AND seen_at >= ?",
+            (user["id"], room["id"], iso(now() - timedelta(seconds=20))),
         ).fetchone()
         if not present:
             self.send_json(403, {"error": "Join the room first."})
@@ -785,7 +759,7 @@ class App(BaseHTTPRequestHandler):
             self.send_json(400, {"error": "Room name must be 3–40 characters."})
             return
         slug = "p-" + secrets.token_hex(4)
-        invite = secrets.token_hex(3)
+        invite = secrets.token_urlsafe(18)
         goal = str(payload.get("goal") or "")[:80]
         connection.execute(
             """
@@ -798,9 +772,16 @@ class App(BaseHTTPRequestHandler):
 
 
 def main():
+    global SECURE_COOKIES
+    parser = argparse.ArgumentParser(description='Run the existing Squeek Hours shared service.')
+    parser.add_argument('--host', default='127.0.0.1')
+    parser.add_argument('--port', type=int, default=PORT)
+    parser.add_argument('--secure-cookies', action='store_true', help='Use behind an HTTPS reverse proxy; cookies require HTTPS.')
+    args = parser.parse_args()
+    SECURE_COOKIES = args.secure_cookies
     init_db()
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), App)
-    print(f"SQUEEK HOURS on http://127.0.0.1:{PORT}")
+    server = ThreadingHTTPServer((args.host, args.port), App)
+    print(f"SQUEEK HOURS on http://{args.host}:{args.port}")
     server.serve_forever()
 
 

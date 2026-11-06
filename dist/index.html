@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Squeek Hours</title>
+  <meta name="description" content="Work together. Move the world. Focus rooms paced by Squeekchain.">
+  <meta property="og:title" content="Squeek Hours · Work together. Move the world.">
+  <meta property="og:description" content="Focus sessions, shared rooms and real Squeekchain progress. Focus XP is not SQK.">
+  <meta property="og:image" content="./art/focus-league.png">
+  <meta name="theme-color" content="#090d16">
+  <link rel="icon" type="image/svg+xml" href="./favicon.svg">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="top">
+    <div>
+      <p class="mark">Squeek Hours</p>
+      <p class="slogan">Work together. Move the world.</p>
+    </div>
+    <nav aria-label="Main navigation">
+      <button type="button" data-view="home">Home</button>
+      <button type="button" data-view="rooms">Rooms</button>
+      <button type="button" data-view="world">World</button>
+      <button type="button" data-view="expeditions">Expeditions</button>
+      <button type="button" data-view="board">Board</button>
+      <button type="button" data-view="profile">Profile</button>
+    </nav>
+    <div class="who">
+      <span id="who">Guest</span>
+      <button type="button" id="auth-open" class="ghost">Sign in</button>
+    </div>
+  </header>
+
+  <main id="main" tabindex="-1">
+    <p id="service-note" class="service-note" role="status">Checking session storage…</p>
+    <p id="page-error" class="error" role="alert"></p>
+    <section id="view-home" class="view">
+      <h1>Make time for focus.</h1>
+      <div class="clock" id="clock">
+        <div class="hud">
+          <p class="timer" id="timer" role="timer" aria-label="Session time remaining">25:00</p>
+          <p id="session-note" role="status">Choose a session to begin.</p>
+          <div class="row">
+            <button type="button" id="start-25">Start 25 minutes</button>
+            <button type="button" id="start-50" class="ghost">Start 50 minutes</button>
+            <button type="button" id="cancel" class="ghost hidden">Cancel session</button>
+          </div>
+          <details id="custom-controls">
+            <summary>Custom duration</summary>
+            <form id="custom-form" class="row">
+              <label for="custom-minutes">Minutes (1–120)<input id="custom-minutes" type="number" min="1" max="120" step="1" value="25" required></label>
+              <button type="submit" id="start-custom" class="ghost">Start custom session</button>
+            </form>
+            <p class="muted small">At least 5 minutes earns XP. Cancelled sessions earn none.</p>
+          </details>
+        </div>
+        <img src="./art/hamster-clock.png" alt="Squeektoshi in the wheel.">
+      </div>
+      <section id="chain-panel" class="chain-panel" aria-labelledby="chain-title">
+        <div class="row spread">
+          <h2 id="chain-title">Squeekchain</h2>
+          <button id="chain-retry" type="button" class="ghost">Refresh chain</button>
+        </div>
+        <p id="chain-line" role="status">Loading confirmed settlement…</p>
+        <p id="chain-freshness" class="muted small"></p>
+        <p class="state" id="chain-state">Checking wheel activity…</p>
+        <p id="chain-pending" class="muted small"></p>
+        <details>
+          <summary>Data sources and confirmation</summary>
+          <p id="chain-proof" class="small"></p>
+          <a id="chain-tx" class="hidden" target="_blank" rel="noopener noreferrer">View confirmed transaction on Sepolia Etherscan</a>
+          <p class="muted small">Activity and pending rounds are provisional. They never unlock a world stage. Focus XP is not SQK.</p>
+          <a href="https://docs.squeekchain.com/developers/api/" target="_blank" rel="noopener noreferrer">Official API documentation</a>
+        </details>
+      </section>
+      <div class="grid">
+        <article>
+          <h2>Today</h2>
+          <p class="big" id="today">Unavailable</p>
+          <p><span id="today-label">community focus minutes from finished sessions</span></p>
+          <p id="live-count">Shared participation has not loaded.</p>
+        </article>
+        <article>
+          <h2>Expedition</h2>
+          <p id="mission-name">Mission 001 · Build the First City</p>
+          <p id="mission-bar"></p>
+        </article>
+      </div>
+    </section>
+
+    <section id="view-rooms" class="view hidden">
+      <h2 tabindex="-1">Focus rooms</h2>
+      <p class="muted">Work together in public rooms, or invite people into a private room. Participation refreshes every 4 seconds.</p>
+      <p id="rooms-status" role="status"></p>
+      <p id="room-error" class="error" role="alert"></p>
+      <article id="room-panel" class="hidden">
+        <h2 id="room-name" tabindex="-1">Room</h2>
+        <p id="room-goal"></p>
+        <button type="button" id="room-leave" class="ghost">Leave room</button>
+        <button type="button" id="room-start">Focus in this room</button>
+        <ul id="room-people"></ul>
+        <label>Working on <input id="room-focus" maxlength="80"></label>
+        <ul id="room-log" aria-label="Room messages"></ul>
+        <form id="room-form">
+          <label for="room-text">A short note<input id="room-text" maxlength="140" required placeholder="What are you working on?"></label>
+          <button type="submit" class="ghost">Send</button>
+        </form>
+      </article>
+      <div id="room-list" class="grid"></div>
+      <article>
+        <h2>Private room</h2>
+        <form id="private-form">
+          <label for="private-name">Room name<input id="private-name" minlength="3" maxlength="40" required></label>
+          <label for="private-goal">Shared goal (optional)<input id="private-goal" maxlength="80"></label>
+          <button type="submit" class="ghost">Create</button>
+        </form>
+        <p id="private-result" role="status"></p>
+        <form id="invite-form">
+          <label for="invite-slug">Room code<input id="invite-slug" required autocomplete="off"></label>
+          <label for="invite-code">Invite code<input id="invite-code" required autocomplete="off"></label>
+          <button type="submit" class="ghost">Join private</button>
+        </form>
+      </article>
+    </section>
+
+    <section id="view-world" class="view hidden">
+      <img class="banner" src="./art/focus-room.jpg" alt="The shared burrow.">
+      <h2 id="world-name" tabindex="-1">Waiting for confirmed settlement</h2>
+      <p id="world-copy"></p>
+    </section>
+
+    <section id="view-expeditions" class="view hidden">
+      <h2 tabindex="-1">Community expedition</h2>
+      <p>People's sessions and the hamster's settled rounds are separate counts.</p>
+      <div id="expedition"></div>
+    </section>
+
+    <section id="view-board" class="view hidden">
+      <img class="banner" src="./art/focus-league.png" alt="Focus league desk.">
+      <h2 tabindex="-1">Focus league</h2>
+      <p id="board-note" role="status">Ranks come from finished sessions. Focus XP is not SQK.</p>
+      <ol id="leaders"></ol>
+    </section>
+
+    <section id="view-profile" class="view hidden">
+      <h2 id="profile-name" tabindex="-1">Profile</h2>
+      <p id="profile-scope" class="muted"></p>
+      <form id="device-profile" class="row hidden">
+        <label for="device-name">Display name<input id="device-name" required maxlength="20" autocomplete="nickname"></label>
+        <button type="submit" class="ghost">Save name</button>
+      </form>
+      <p id="profile-stats"></p>
+      <div id="themes" class="row"></div>
+      <ul id="badges"></ul>
+      <button type="button" id="share" disabled class="ghost">Download share card</button>
+    </section>
+  </main>
+
+  <dialog id="auth" aria-labelledby="auth-title">
+    <form id="auth-form">
+      <h2 id="auth-title">Sign in</h2>
+      <p id="auth-help" class="muted"></p>
+      <div id="auth-fields">
+      <label>Username <input name="username" autocomplete="username" required minlength="3" maxlength="20" aria-describedby="auth-error"></label>
+      <label>Password <input name="password" type="password" autocomplete="current-password" required minlength="8" maxlength="256" aria-describedby="auth-error"></label>
+      <div class="row">
+        <button type="submit">Sign in</button>
+        <button type="button" id="register">Create account</button>
+      </div>
+      </div>
+      <p id="auth-error" role="alert"></p>
+      <button type="button" id="auth-close" class="ghost">Close</button>
+    </form>
+  </dialog>
+  <footer>
+    <p>Squeek Hours · Focus XP is not SQK.</p>
+    <a href="https://squeekchain.com" target="_blank" rel="noopener noreferrer">Explore Squeekchain</a>
+  </footer>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
